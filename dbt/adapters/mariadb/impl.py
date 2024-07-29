@@ -1,23 +1,24 @@
 from concurrent.futures import Future
 from dataclasses import asdict
-from typing import Optional, List, Dict, Any, Iterable, Tuple
+from typing import Optional, List, Dict, Any, Iterable, Tuple, FrozenSet
 import agate
 
-import dbt
-import dbt.exceptions
+import dbt_common.exceptions
 
 from dbt.adapters.base.impl import catch_as_completed
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.mariadb import MariaDBConnectionManager
 from dbt.adapters.mariadb import MariaDBRelation
 from dbt.adapters.mariadb import MariaDBColumn
-from dbt.adapters.base import BaseRelation
-from dbt.contracts.graph.nodes import ConstraintType
+from dbt.adapters.base import BaseRelation, SchemaSearchMap
+from dbt_common.contracts.constraints import ConstraintType
 from dbt.adapters.base.impl import ConstraintSupport
-from dbt.contracts.graph.manifest import Manifest
-from dbt.clients.agate_helper import DEFAULT_TYPE_TESTER
-from dbt.events import AdapterLogger
-from dbt.utils import executor
+from dbt.adapters.contracts.relation import RelationConfig
+from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
+from dbt.adapters.events.logging import AdapterLogger
+from dbt_common.utils import executor
+from multiprocessing.context import SpawnContext
+
 
 logger = AdapterLogger("mysql")
 
@@ -26,6 +27,9 @@ LIST_RELATIONS_MACRO_NAME = "list_relations_without_caching"
 
 
 class MariaDBAdapter(SQLAdapter):
+    def __init__(self, config, mp_context: SpawnContext) -> None:
+        super().__init__(config, mp_context)
+
     Relation = MariaDBRelation
     Column = MariaDBColumn
     ConnectionManager = MariaDBConnectionManager
@@ -61,7 +65,7 @@ class MariaDBAdapter(SQLAdapter):
         kwargs = {"schema_relation": schema_relation}
         try:
             results = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
-        except dbt.exceptions.DbtRuntimeError as e:
+        except dbt_common.exceptions.DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
             if f"MariaDB database '{schema_relation}' not found" in errmsg:
                 return []
@@ -73,7 +77,7 @@ class MariaDBAdapter(SQLAdapter):
         relations = []
         for row in results:
             if len(row) != 4:
-                raise dbt.exceptions.DbtRuntimeError(
+                raise dbt_common.exceptions.DbtRuntimeError(
                     "Invalid value from "
                     f'"mariadb__list_relations_without_caching({kwargs})", '
                     f"got {len(row)} values, expected 4"
@@ -125,39 +129,38 @@ class MariaDBAdapter(SQLAdapter):
             for idx, column in enumerate(raw_rows)
         ]
 
-    def get_catalog(self, manifest: Manifest) -> Tuple[agate.Table, List[Exception]]:
-        schema_map = self._get_catalog_schemas(manifest)
-
-        if len(schema_map) > 1:
-            raise dbt.exceptions.CompilationError(
-                f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
-            )
-
+    def get_catalog(
+        self,
+        relation_configs: Iterable[RelationConfig],
+        used_schemas: FrozenSet[Tuple[str, str]],
+    ) -> Tuple["agate.Table", List[Exception]]:
         with executor(self.config) as tpe:
-            futures: List[Future[agate.Table]] = []
+            futures: List[Future["agate.Table"]] = []
+            schema_map: SchemaSearchMap = self._get_catalog_schemas(relation_configs)
+            if len(schema_map) > 1:
+                raise dbt_common.exceptions.CompilationError(
+                    f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
+                )
             for info, schemas in schema_map.items():
-                for schema in schemas:
-                    futures.append(
-                        tpe.submit_connected(
-                            self,
-                            schema,
-                            self._get_one_catalog,
-                            info,
-                            [schema],
-                            manifest,
-                        )
-                    )
-            catalogs, exceptions = catch_as_completed(futures)
+                if len(schemas) == 0:
+                    continue
+                name = ".".join([str(info.database), "information_schema"])
+                fut = tpe.submit_connected(
+                    self, name, self._get_one_catalog, info, schemas, used_schemas
+                )
+                futures.append(fut)
+
+        catalogs, exceptions = catch_as_completed(futures)
         return catalogs, exceptions
 
     def _get_one_catalog(
         self,
         information_schema,
         schemas,
-        manifest,
+        relation_config,
     ) -> agate.Table:
         if len(schemas) != 1:
-            raise dbt.exceptions.CompilationError(
+            raise dbt_common.exceptions.CompilationError(
                 f"Expected only one schema in mariadb _get_one_catalog, found " f"{schemas}"
             )
 
@@ -207,7 +210,7 @@ class MariaDBAdapter(SQLAdapter):
         elif location == "prepend":
             return f"concat({value}, '{add_to}')"
         else:
-            raise dbt.exceptions.DbtRuntimeError(
+            raise dbt_common.exceptions.DbtRuntimeError(
                 f'Got an unexpected location value of "{location}"'
             )
 

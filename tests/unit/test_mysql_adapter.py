@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 import dbt.flags as flags
 from dbt.adapters.mysql import MySQLAdapter
-
+from multiprocessing import get_context
 from .utils import config_from_parts_or_dicts, mock_connection
 
 
@@ -42,7 +42,7 @@ class TestMySQLAdapter(unittest.TestCase):
     @property
     def adapter(self):
         if self._adapter is None:
-            self._adapter = MySQLAdapter(self.config)
+            self._adapter = MySQLAdapter(self.config, get_context("spawn"))
         return self._adapter
 
     @mock.patch("dbt.adapters.mysql.connections.mysql.connector")
